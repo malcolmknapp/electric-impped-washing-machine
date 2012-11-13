@@ -1,0 +1,466 @@
+// Electric Impped Washing Machine
+/*
+
+    Author: Malcolm Knapp
+    Date: 11/09/12
+    Adapterd from code created by
+    
+    deldrid1
+    http://forums.electricimp.com/discussion/329/setting-up-a-button-on-hannah/p1
+
+    gbsallery
+    http://forums.electricimp.com/discussion/209/hannah-accelerometer-interrupts/p1
+
+    Eric Allan
+    https://gist.github.com/3894193
+    
+    colorblink 
+    http://devwiki.electricimp.com/doku.php?id=colorblink
+    
+    Description: This code uses the base IOExpander. This code is then extended to add in support for the LED, accelerometer, and buttons. Initialization handled 
+    by the following variables:
+    
+    local timeout = 3   // the duration in minutes
+    local POLL_INTERVAL = 0.5 //  interval is seconds between polling the accelerometer 
+    local ACCEL_THRESHOLD = 50; // threshold signal for the accelerometer
+    local INTERNAL_TIMEOUT = timeout*60/POLL_INTERVAL  // scale by poll interval
+    
+    The values can be adjusted as needed. 
+    
+    The code logic is as follows
+    
+    - Power on and the code starts 
+    - the timeout in minutes in converted to INTERNAL_TIMEOUT which is scaled by the poll interval
+    - the code waits for a button press
+    - A button press to starts the monitor and begins measuring the acceleration of the Hannah board.
+    - the code waits for a acceleration value over the ACCEL_THRESHOLD
+    - if it see it the code starts a timer that counts up to the timeout value. However if the acceleration goes over ACCEL_THRESHOLD again the timer is reset
+    - When the timer counts up to the INTERNAL_TIMEOUT the sms is sent and the code waits for another button press. 
+    
+    This source code under a CC BY-SA 3.0 (http://creativecommons.org/licenses/by-sa/3.0/) License. You can use, modify, and distribute the source
+    code and executable programs based on the source code.
+
+    However, note the following:
+
+    DISCLAIMER OF WARRANTY
+
+    This source code is provided "as is" and without warranties as to performance or merchantability. The author and/or distributors of this source code
+    may have made statements about this source code. Any such statements do not constitute warranties and shall not be relied on by the user in
+    deciding whether to use this source code.
+
+    This source code is provided without any express or implied warranties whatsoever. Because of the diversity of conditions and hardware under 
+    which this source code may be used, no warranty of fitness for a particular purpose is offered. The user is advised to test the source code 
+    thoroughly before relying on it. The user must assume the entire risk of using the source code.
+
+*/
+
+// IO Expander Class for SX1509
+class IOExpander
+{
+
+I2CPort = null;
+I2CAddress = null;
+IRQ_Callbacks = array(16);
+
+constructor (port, address) {
+
+// Configure port and save address
+if (port == I2C_12) {
+
+// Configure I2C bus on pins 1,2
+hardware.configure(I2C_12);
+I2CPort = hardware.i2c12;
+}
+else if (port == I2C_89) {
+
+// Configure I2C bus on pins 8,9
+hardware.configure (I2C_89)
+I2CPort = hardware.i2c89;
+}
+else {
+
+// Problem somewhere
+server.log(format("Invalid I2C port specified: %c", port));
+}
+I2CAddress = address << 1;
+hardware.pin1.configure(DIGITAL_IN, getIRQSources.bindenv(this));
+}
+
+// Read a byte
+function read(register) {
+
+// Read and return data if successful
+local data = I2CPort.read(I2CAddress, format("%c", register), 1);
+if (data != null) return data[0];
+
+// Error, return -1
+server.log("I2C Read Failed");
+return -1;
+}
+
+// Write a byte
+function write (register, data) {
+I2CPort.write(I2CAddress, format("%c%c", register, data));
+}
+
+// Write a bit to a register
+function writeBit (register, bitn, level) {
+local value = read(register);
+value = (level == 0)?(value & ~(1<<bitn)):(value | (1<<bitn));
+write(register, value);
+}
+
+// Write a masked bit pattern
+function writeMasked (register, data, mask) {
+local value = read (register);
+value = (value & ~mask) | (data & mask);
+write (register, value);
+}
+
+// Set a GPIO direction
+function setDir (gpio, output){
+writeBit (gpio>=8?0x0e:0x0f, gpio&7, output?0:1);
+}
+
+// Set a GPIO level
+function setPin (gpio, level){
+writeBit (gpio>=8?0x10:0x11, gpio&7, level?1:0);
+}
+
+// Enable/disable a GPIO internal pull-up resistor
+function setPullUp (gpio, enable) {
+writeBit (gpio>=8?0x06:0x07, gpio&7, enable);
+}
+
+// Set GPIO interrupt mask
+function setIRQMask (gpio, enable) {
+writeBit (gpio>=8?0x12:0x13, gpio&7, enable);
+}
+
+// Set GPIO interrupt edges
+function setIRQEdges (gpio, rising, falling) {
+local addr = 0x17 - (gpio>>2);
+local mask = 0x03 << ((gpio&3)<<1);
+local data = (2*falling + rising) << ((gpio&3)<<1);
+writeMasked (addr, data, mask);
+}
+
+// Clear an interrupt
+function clearIRQ (gpio) {
+writeBit (gpio>=8?0x18:0x19, gpio&7, 1);
+}
+
+function setIRQCallBack(pin, func){
+IRQ_Callbacks[pin] = func;
+}
+
+function clearIRQCallBack(pin){
+IRQ_Callbacks[pin] = null;
+}
+
+function getIRQSources(){
+//0x18=RegInterruptSourceB (Pins 15->8), 1 is an interrupt and we write a 1 to clear the interrupt
+//0x19=RegInterruptSourceA (Pins 7->0), 1 is an interrupt and we write a 1 to clear the interrupt
+local sourceB = read(0x18);
+local sourceA = read(0x19);
+
+local irqSources = array(16);
+
+local j = 0;
+for(local z=1; z < 256; z = z<<1){
+irqSources[j] = ((sourceA & z) == z);
+irqSources[j+8] = ((sourceB & z) == z);
+j++;
+}
+//server.log(format("irqSource=%s", byteArrayString(irqSource)));
+
+//TODO: This could be in the loop above if performance becomes an issue
+for(local pin=0; pin < 16; pin++){
+if(irqSources[pin]){
+IRQ_Callbacks[pin]();
+clearIRQ(pin);
+}
+}
+
+//Clear the interrupts //Currently callback functions handle this
+//write(0x18, 0xFF);
+//write(0x19, 0xFF);
+return irqSources; //Array of the IO pins and who has active interrupts
+}
+
+// Get a GPIO input pin level
+function getPin (gpio) {
+//If gpio pin is greater than or equal to 8 then its staus is in the 0x10 register, else its in the 0x11 register. Then left shift to create a mask for the particular pin and return true or false based on its value
+return (read(gpio>=8?0x10:0x11)&(1<<(gpio&7))) ? 1 : 0;
+}
+
+}
+
+
+// PushButton Class for Hannah
+class PushButton extends IOExpander
+{
+// IO Pin assignment
+pin = null;
+irq = null;
+
+// Output port
+outPort = null;
+//Callback function for interrupt
+callBack = null;
+
+constructor(port, address, btnPin, irqPin, out, call)
+{
+//server.log("Contructing PushButton")
+base.constructor(port, address);
+
+// Save assignments
+pin = btnPin;
+irq = irqPin;
+outPort = out;
+callBack = call;
+
+// Set event handler for irq
+if (irqPin != null) //This is handled by our IOExpander class
+irqPin.configure(DIGITAL_IN, irqHandler.bindenv(this));
+else
+setIRQCallBack(btnPin, irqHandler.bindenv(this))
+
+// Configure pin as input, irq on both edges
+setDir(pin, 0);
+setPullUp(pin,1)
+setIRQMask(pin, 0);
+setIRQEdges(pin, 1, 1);
+
+//server.log("PushButton Constructed")
+}
+
+function irqHandler()
+{
+local state = null;
+
+// Get the pin state
+state = getPin(pin)?0:1;
+
+// Output to port and display on node
+if (outPort != null) outPort.set(state);
+//server.show(format("Push Button %d = %d", pin, state));
+//server.log(format("Push Button %d = %d", pin, state));
+if (callBack != null && state == 1) callBack() //Only call the callback on the push down event, not the release
+
+
+// Clear the interrupt
+clearIRQ(pin);
+}
+
+function readState()
+{
+local state = getPin(pin);
+
+server.log(format("debug %d", state));
+return state;
+}
+}
+
+ 
+ 
+// RGB LED Class
+class RgbLed extends IOExpander
+{
+    // IO Pin assignments
+    pinR = null;
+    pinG = null;
+    pinB = null;
+ 
+    constructor(port, address, r, g, b)
+    {
+        base.constructor(port, address);
+ 
+        // Save pin assignments
+        pinR = r;
+        pinG = g;
+        pinB = b;
+ 
+        // Disable pin input buffers
+        writeBit(pinR>7?0x00:0x01, pinR>7?(pinR-7):pinR, 1);
+        writeBit(pinG>7?0x00:0x01, pinG>7?(pinG-7):pinG, 1);
+        writeBit(pinB>7?0x00:0x01, pinB>7?(pinB-7):pinB, 1);
+ 
+        // Set pins as outputs
+        writeBit(pinR>7?0x0E:0x0F, pinR>7?(pinR-7):pinR, 0);
+        writeBit(pinG>7?0x0E:0x0F, pinG>7?(pinG-7):pinG, 0);
+        writeBit(pinB>7?0x0E:0x0F, pinB>7?(pinB-7):pinB, 0);
+ 
+        // Set pins open drain
+        writeBit(pinR>7?0x0A:0x0B, pinR>7?(pinR-7):pinR, 1);
+        writeBit(pinG>7?0x0A:0x0B, pinG>7?(pinG-7):pinG, 1);
+        writeBit(pinB>7?0x0A:0x0B, pinB>7?(pinB-7):pinB, 1);
+ 
+        // Enable LED drive
+        writeBit(pinR>7?0x20:0x21, pinR>7?(pinR-7):pinR, 1);
+        writeBit(pinG>7?0x20:0x21, pinG>7?(pinG-7):pinG, 1);
+        writeBit(pinB>7?0x20:0x21, pinB>7?(pinB-7):pinB, 1);
+ 
+        // Set to use internal 2MHz clock, linear fading
+        write(0x1e, 0x50);
+        write(0x1f, 0x10);
+ 
+        // Initialise as inactive
+        setLevels(0, 0, 0);
+        setPin(pinR, 0);
+        setPin(pinG, 0);
+        setPin(pinB, 0);
+    }
+ 
+    // Set LED enabled state
+    function setLed(r, g, b)
+    {
+        if(r != null) writeBit(pinR>7?0x20:0x21, pinR&7, r);
+        if(g != null) writeBit(pinG>7?0x20:0x21, pinG&7, g);
+        if(b != null) writeBit(pinB>7?0x20:0x21, pinB&7, b);
+    }
+ 
+    // Set red, green and blue intensity levels
+    function setLevels(r, g, b)
+    {
+        if(r != null) write(pinR<4?0x2A+pinR*3:0x36+(pinR-4)*5, r);
+        if(g != null) write(pinG<4?0x2A+pinG*3:0x36+(pinG-4)*5, g);
+        if(b != null) write(pinB<4?0x2A+pinB*3:0x36+(pinB-4)*5, b);
+    }
+}
+
+ // Accelerometer Class
+class Accelerometer extends IOExpander // clearly, this is not really an IOExpander, we're just nicking it's read() function
+{
+    constructor(port, address)
+    {
+        base.constructor(port, address);
+        
+        write(0x20, 0x47); // Bring device out of power-down,
+    
+        setDir(3, 0);
+        setPullUp(3, true);
+    }
+ 
+    function getZ() {
+        return read(0x2d);
+    }
+    function getY() {
+        return read(0x2b);
+    }
+    function getX() {
+        return read(0x29);
+    }
+}
+
+local running = 0
+
+function button1 () {
+    server.log ("Monitoring Started")
+    server.log("Start Test 2!!!*************************");
+    server.show("Starting washing machine")
+    running = 1;
+ 
+    // Set the LED color
+    led.setLevels(1, 100, 1);
+    
+}
+
+function button2 () {
+    server.log ("Monitoring Started")
+    server.log("Start Test 2!!!*************************");
+    server.show("Starting washing machine")
+    running = 1;
+ 
+    // Set the LED color
+    led.setLevels(1, 100, 1);
+    
+}
+
+//Instantiate the accelerometer
+accelerometer <- Accelerometer(I2C_89, 0x1c); // has to be above to pushbutton instanation for some reason.
+ 
+//Instantiate the buttons
+pushButton1 <- PushButton(I2C_89, 0x3e, 0, null, null, button1);
+pushButton2 <- PushButton(I2C_89, 0x3e, 1, null, null, button2);
+
+// Construct an LED
+led <- RgbLed(I2C_89, 0x3E, 7, 5, 6);
+
+local out = OutputPort("Acceleration", "number")
+local averageX = 0
+local averageY = 0
+local averageZ = 0
+local warmup = 0
+local timer = 0
+local startTimer = 0
+local exponentialFactor = 0.9
+
+
+// User set points. Adjust these to your washing machine
+local timeout = 3   // the duration in minutes
+local POLL_INTERVAL = 0.5 //  interval is seconds between polling the acellerometer 
+local ACCEL_THRESHOLD = 50; // threshold signal for teh accelerometer
+local INTERNAL_TIMEOUT = timeout*60/POLL_INTERVAL  // scale by poll interval
+
+server.log(format("Poll Interval: %f seconds", POLL_INTERVAL));
+server.log(format("Acceleration Threshold: %d", ACCEL_THRESHOLD));
+server.log(format("Timeout: %d minutes", timeout));
+server.log(format("Internal Timeout: %d", INTERNAL_TIMEOUT));
+
+// Change to a random color every 500ms
+function poll() {
+    imp.wakeup(POLL_INTERVAL, poll)
+    
+    if (running == 1) {
+        
+        local xtest = accelerometer.getX()
+        local ytest = accelerometer.getY()
+        local ztest = accelerometer.getZ()
+
+
+        local x = ((xtest + 128) % 256) - 128.0
+        local y = ((ytest + 128) % 256) - 128.0
+        local z = ((ztest + 128) % 256) - 128.0
+    
+        averageX = averageX * exponentialFactor + x * (1-exponentialFactor)
+        averageY = averageY * exponentialFactor + y * (1-exponentialFactor)
+        averageZ = averageZ * exponentialFactor + z * (1-exponentialFactor)
+    
+        local motion = math.abs(x-averageX) + math.abs(y-averageY) + math.abs(z-averageZ) 
+        //server.log(format("current motion:! %d", motion));
+
+        if(motion > ACCEL_THRESHOLD && warmup > 3/(1-exponentialFactor)) {
+            server.log(format("triggered! %d", motion))
+            timer = 0
+            startTimer = 1
+        } else {
+            warmup += 1
+            if (timer > INTERNAL_TIMEOUT){
+                server.log("send sms")
+                out.set (1)
+                server.show("washing machine is done")
+                server.log("turning off timer")
+                timer = 0
+                startTimer = 0
+                running = 0
+                led.setLevels(100, 1, 1);
+            }
+        }   
+        
+        if (startTimer) {
+            timer++
+            server.log(format("timer count:! %d", timer));
+        }    
+    }
+}
+ 
+// Register with the server
+imp.configure("Washing Machine V04", [], [out]);
+ 
+// Enable the LED outputs and start color changing
+led.setLed(1, 1, 1);
+led.setLevels(100, 1, 1);
+poll();
+ 
+// End of code.

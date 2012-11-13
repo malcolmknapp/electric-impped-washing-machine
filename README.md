@@ -1,2 +1,0 @@
-electric-impped-washing-machine
-===============================
