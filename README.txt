@@ -1,7 +1,9 @@
 README
 
+Name: Electric Impped Washing Machine
 Author: Malcolm Knapp
 Date: 11/09/12
+Verion: 0.1
 Adapterd from code created by
 
 deldrid1
